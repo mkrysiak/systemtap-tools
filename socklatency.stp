@@ -1,0 +1,89 @@
+#!/usr/bin/stap
+/*
+ * socklatency.stp Measure sendmsg() to recvmsg()
+ *      latency, operations, and throughput
+ *
+ *.This was inspired by Brendan Gregg's weblatency-nd.stp
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+
+global ts[8192];	# max concurrent requests
+global sendsize;
+global lat;
+global wsize;
+global rsize;
+
+probe begin
+{
+	printf("Tracing sendmsg()->recvmsg()... Hit Ctrl-C to end.\n");
+}
+
+
+/* socket writes */
+probe tcp.sendmsg
+{
+  if(progenyof(target())) {
+    ts[pid(), inet_get_ip_source(sock), inet_get_local_port(sock)] = gettimeofday_ns();
+    sendsize[pid(), inet_get_ip_source(sock), inet_get_local_port(sock)] = size;
+  }
+}
+
+/* socket reads */
+probe tcp.recvmsg.return
+{
+  if(progenyof(target())) {
+    prev = ts[pid(), daddr, sport];
+    if (prev != 0) {
+      dest = sprintf("%s:%d", daddr, dport);
+      lat[pid(), dest] <<<
+        (gettimeofday_ns() - prev) / 1000;
+      wsize[pid(), dest] <<< sendsize[pid(), daddr, sport];
+      if(size > 0) {
+        rsize[pid(), dest] <<< size;
+      }
+    }
+  }
+}
+
+probe end
+{
+  printf("statistics:\n");
+  printf("%-5s  %20s %11s %11s %15s %15s %15s %15s %15s %15s %15s %15s\n",
+         "PID", "Dest", "Count", "Avg(us)", "Max(us)", "Sum(us)", "Avg(WB)",
+         "Max(WB)", "Sum(WB)", "Avg(RB)", "Max(RB)", "Sum(RB)");
+  foreach ([p, d] in lat+) {
+    printf("%-5d  %20s %11d %11d %15d %15d %15d %15d %15d %15d %15d %15d\n",
+            p, d, @count(lat[p, d]), @avg(lat[p, d]), @max(lat[p, d]), @sum(lat[p, d]),
+            @avg(wsize[p, d]), @max(wsize[p, d]), @sum(wsize[p, d]),
+            @avg(rsize[p, d]), @max(rsize[p, d]), @sum(rsize[p, d]));
+  }
+  printf("\nhistogram:\n");
+  foreach ([p, d] in lat+) {
+    printf("PID: %-5d Destination: %s\n", p, d);
+    printf("count: %d, avg: %d us, max: %d us, sum: %d us, dist (us):\n",
+        @count(lat[p, d]), @avg(lat[p, d]), @max(lat[p, d]), @sum(lat[p, d]));
+    print(@hist_log(lat[p, d]));
+  }
+}
+
+function progenyof(pid:long) {
+    parent = task_parent(task_current());
+    task = pid2task(pid);
+
+    while(parent && task_pid(parent) > 0) {
+        if(task == parent)
+            return 1;
+
+        parent = task_parent(parent);
+    }
+}
